@@ -1,246 +1,442 @@
 import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
 from pathlib import Path
 import warnings
 warnings.filterwarnings("ignore")
  
-# ── DIRECTORIES ───────────────────────────────────────────────────────────────
+# MAPPEN
 INPUT_DIR  = Path("data") / "intermediate"
 OUTPUT_DIR = Path("data") / "clean"
+PLOTS_DIR  = Path("plots") / "data_clean"
  
-PROLONGED_GAP_DAYS = 3   # gaps longer than this get flagged as synthetic
-ROLLING_WINDOW     = 7   # days for rolling mean imputation
-WINSOR_LOW         = 0.01
-WINSOR_HIGH        = 0.99
+def _setup_dirs():
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    PLOTS_DIR.mkdir(parents=True, exist_ok=True)
  
-# Variables where missing = "not used that day" → fill with 0
+def ipath(name): return INPUT_DIR / name
+def opath(name): return OUTPUT_DIR / name
+def ppath(name): return PLOTS_DIR / name
+ 
 ZERO_FILL_VARS = [
     "appCat.builtin", "appCat.communication", "appCat.entertainment",
     "appCat.finance", "appCat.game", "appCat.office", "appCat.other",
     "appCat.social", "appCat.travel", "appCat.unknown", "appCat.utilities",
-    "appCat.weather",
+    "appCat.weather", "call", "sms",
 ]
  
-# Variables that are genuinely missing sensor/self-report data → time-series impute
 TIMESERIES_VARS = [
-    "mood", "circumplex.arousal", "circumplex.valence",
-    "screen", "activity",
+    "mood", "circumplex.arousal", "circumplex.valence", "screen", "activity",
 ]
  
-# Variables to re-encode as binary presence flags (always 1 when present)
-BINARY_PRESENCE_VARS = ["call", "sms"]
+# Alle kolommen die als bewijs van activiteit tellen voor de drempelwaarde check
+ACTIVITY_EVIDENCE_COLS = (
+    ZERO_FILL_VARS
+    + ["screen", "mood", "circumplex.arousal", "circumplex.valence", "activity"]
+)
  
-# Variables to Winsorize (heavy-tailed appCat durations + screen)
-WINSORISE_VARS = [
-    "appCat.builtin", "appCat.communication", "appCat.entertainment",
-    "appCat.finance", "appCat.game", "appCat.office", "appCat.other",
-    "appCat.social", "appCat.travel", "appCat.unknown", "appCat.utilities",
-    "appCat.weather", "screen", "activity",
-]
+PROLONGED_GAP_DAYS = 3
+MIN_ACTIVE_COLS    = 4   # minimaal aantal andere kolommen met echte data
  
  
-def _setup_dirs():
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
- 
- 
-def ipath(name):
-    return INPUT_DIR / name
- 
- 
-def opath(name):
-    return OUTPUT_DIR / name
- 
- 
-# ── STEP 1: REMOVE HARD ERRORS ────────────────────────────────────────────────
-def remove_hard_errors(df):
-    """Remove physically impossible values (e.g. negative durations)."""
-    print("\n── Step 1: Remove hard errors")
-    before = len(df)
- 
-    # Duration columns cannot be negative
-    duration_cols = ZERO_FILL_VARS + ["screen", "activity"]
-    for col in duration_cols:
-        if col in df.columns:
-            n = (df[col] < 0).sum()
-            if n > 0:
-                print(f"   {col}: setting {n} negative values to NaN")
-                df.loc[df[col] < 0, col] = np.nan
- 
-    print(f"   Rows before: {before:,}  →  after: {len(df):,}")
-    return df
- 
- 
-# ── STEP 2: WINSORIZE ─────────────────────────────────────────────────────────
-def winsorise(df):
-    """Cap extreme values at 1st/99th percentile per variable (not per subject)."""
-    print("\n── Step 2: Winsorize heavy-tailed variables")
-    for col in WINSORISE_VARS:
+# STAP 1: HARDE FOUTEN VERWIJDEREN
+def step1_remove_hard_errors(df):
+    print("Step 1: hard errors")
+    n_fixed = 0
+    for col in ZERO_FILL_VARS + ["screen", "activity"]:
         if col not in df.columns:
             continue
-        lo = df[col].quantile(WINSOR_LOW)
-        hi = df[col].quantile(WINSOR_HIGH)
-        n_lo = (df[col] < lo).sum()
-        n_hi = (df[col] > hi).sum()
-        df[col] = df[col].clip(lower=lo, upper=hi)
-        print(f"   {col:<35} clipped [{lo:.3f}, {hi:.3f}]  "
-              f"(low={n_lo}, high={n_hi})")
+        mask = df[col] < 0
+        if mask.any():
+            df.loc[mask, col] = np.nan
+            print(f"  {col}: {int(mask.sum())} negative value(s) -> NaN")
+            n_fixed += int(mask.sum())
+    print(f"  Total fixed: {n_fixed}")
+    print()
     return df
  
  
-# ── STEP 3: BINARY RE-ENCODING ────────────────────────────────────────────────
-def encode_binary_presence(df):
-    """Re-encode call/sms as 0/1 presence flags instead of constant-1 / NaN."""
-    print("\n── Step 3: Re-encode binary presence variables (call, sms)")
-    for col in BINARY_PRESENCE_VARS:
-        if col not in df.columns:
-            continue
-        df[col] = df[col].notna().astype(int)
-        print(f"   {col}: 1 if observed that day, 0 otherwise  "
-              f"(1s: {df[col].sum()}, 0s: {(df[col]==0).sum()})")
-    return df
+# STAP 2: CONDITIONELE NULVULLING PER RIJ
+# Per rij (= één proefpersoon op één dag) tellen we hoeveel ANDERE kolommen
+# een echte niet-nul waarde hebben. Als dat er minstens MIN_ACTIVE_COLS zijn
+# beschouwen we de proefpersoon als actief op die dag en vullen we NaN met 0.
+# Bij minder dan MIN_ACTIVE_COLS actieve kolommen laten we NaN staan.
+# Dit werkt per rij dus automatisch per proefpersoon per dag.
+def step2_conditional_zero_fill(df):
+    print(f"Step 2: conditional zero-fill (min {MIN_ACTIVE_COLS} other active cols per row)")
  
+    # Bereken per rij het aantal kolommen met echte niet-nul waarden
+    evidence_cols = [c for c in ACTIVITY_EVIDENCE_COLS if c in df.columns]
+    # notna en > 0 tegelijk gecontroleerd via applymap
+    active_counts = (df[evidence_cols].notna() & (df[evidence_cols] > 0)).sum(axis=1)
  
-# ── STEP 4: ZERO-FILL appCat MISSINGNESS ─────────────────────────────────────
-def zero_fill_app_cats(df):
-    """Fill missing appCat values with 0 (missing = app not used that day)."""
-    print("\n── Step 4: Zero-fill app category variables")
     for col in ZERO_FILL_VARS:
         if col not in df.columns:
             continue
-        n = df[col].isna().sum()
-        df[col] = df[col].fillna(0)
-        print(f"   {col:<35} filled {n:>4} NaNs with 0")
+        is_nan = df[col].isna()
+ 
+        # Bereken voor elke rij het aantal actieve ANDERE kolommen
+        # (trek de bijdrage van col zelf af als die er al in zit)
+        if col in evidence_cols:
+            col_contributes = (df[col].notna() & (df[col] > 0)).astype(int)
+            other_active = active_counts - col_contributes
+        else:
+            other_active = active_counts
+ 
+        fill_mask = is_nan & (other_active >= MIN_ACTIVE_COLS)
+        n_filled  = int(fill_mask.sum())
+        n_left    = int(is_nan.sum()) - n_filled
+ 
+        df.loc[fill_mask, col] = 0
+        print(f"  {col:<35} filled {n_filled:>4}, left as NaN {n_left:>4}")
+ 
+    print()
     return df
  
  
-# ── STEP 5: TIME-SERIES IMPUTATION WITH SYNTHETIC FLAG ────────────────────────
-def _fill_series_with_flag(series, window=ROLLING_WINDOW, gap_thresh=PROLONGED_GAP_DAYS):
-    """
-    For a single subject's time series (indexed by date, sorted):
-      - Compute a rolling mean (min_periods=1) over past `window` days
-      - Forward-fill gaps using that rolling mean
-      - Return (filled_series, synthetic_flag_series)
-        where synthetic_flag = 1 for any day that was NaN AND belonged to a
-        gap longer than `gap_thresh` days
-    """
-    filled   = series.copy().astype(float)
-    flag     = pd.Series(0, index=series.index, name=series.name + "_synthetic")
- 
-    # Identify contiguous NaN runs and their lengths
-    is_nan   = series.isna()
-    # Label each NaN run with a group id
-    run_id   = (~is_nan).cumsum()
- 
-    for gid, group in filled[is_nan].groupby(run_id[is_nan]):
-        gap_len = len(group)
-        if gap_len > gap_thresh:
-            flag.loc[group.index] = 1
- 
-    # Rolling mean on non-NaN values, then forward-fill NaNs from it
-    roll = filled.fillna(method="ffill").rolling(window=window, min_periods=1).mean()
-    filled = filled.fillna(roll)
-    # Any remaining NaN at the very start (no history): backward fill as last resort
-    filled = filled.fillna(method="bfill")
- 
-    return filled, flag
- 
- 
-def impute_timeseries(df):
-    """
-    Apply rolling-mean + forward-fill imputation per subject per variable.
-    Adds {var}_synthetic columns for gaps > PROLONGED_GAP_DAYS.
-    """
-    print(f"\n── Step 5: Time-series imputation "
-          f"(rolling window={ROLLING_WINDOW}d, gap threshold={PROLONGED_GAP_DAYS}d)")
- 
-    df = df.sort_values(["id", "date"]).copy()
-    synthetic_cols = {}
+# STAP 3 EN 4: INTERPOLATIE MET SYNTHETISCHE VLAG
+# Per proefpersoon per variabele:
+#   - Gebruik datumindex (niet rij-index) voor correcte kalenderdagmeting
+#   - Voor elk paar opeenvolgende observaties: als gat <= 3 dagen -> interpoleer
+#   - Als gat > 3 dagen -> laat NaN, zet synthetische vlag
+#   - Raak nooit rijen aan voor de eerste of na de laatste observatie
+#
+# Technische aanpak om de write-back bug te vermijden:
+#   - Bouw per proefpersoon een volledige datum-geindexeerde Series
+#   - Vul die in segmenten
+#   - Sla resultaten op in een nieuw DataFrame en merge terug op (id, date)
+def step3_4_interpolate_and_flag(df):
+    print(f"Step 3-4: interpolation (gap <= {PROLONGED_GAP_DAYS}d) + synthetic flag (gap > {PROLONGED_GAP_DAYS}d)")
+    df = df.sort_values(["id", "date"]).reset_index(drop=True)
  
     for col in TIMESERIES_VARS:
         if col not in df.columns:
             continue
  
-        filled_all = []
-        flag_all   = []
+        flag_col  = col + "_synthetic"
+        df[flag_col] = 0
  
-        for subj, grp in df.groupby("id"):
-            series = grp.set_index("date")[col]
-            filled, flag = _fill_series_with_flag(series)
-            filled_all.append(filled.rename(col))
-            flag_all.append(flag)
+        # Werk met een kopie van de kolom als Series geindexeerd op (id, date)
+        # zodat de write-back via .loc op (id, date) betrouwbaar werkt
+        new_values = df[col].copy()   # behoudt originele integer index
+        new_flags  = df[flag_col].copy()
  
-        filled_series = pd.concat(filled_all).reset_index(drop=True)
-        flag_series   = pd.concat(flag_all).reset_index(drop=True)
+        n_interpolated = 0
+        n_flagged      = 0
  
-        n_filled    = df[col].isna().sum()
-        n_synthetic = flag_series.sum()
-        df[col]     = filled_series.values
-        synthetic_cols[col + "_synthetic"] = flag_series.values
+        for subj, grp in df.groupby("id", sort=False):
+            # Maak een Series geindexeerd op datum (pd.Timestamp)
+            s = grp.set_index("date")[col].sort_index()
+            # s.index zijn nu Timestamps, s.values zijn de waarden
  
-        print(f"   {col:<30} filled {n_filled:>4} NaNs  |  "
-              f"{n_synthetic:>3} rows flagged synthetic")
+            observed_dates = s[s.notna()].index.tolist()
+            if len(observed_dates) < 2:
+                continue
  
-    # Add all synthetic flag columns
-    for colname, values in synthetic_cols.items():
-        df[colname] = values
+            for i in range(len(observed_dates) - 1):
+                d1       = observed_dates[i]
+                d2       = observed_dates[i + 1]
+                gap_days = (d2 - d1).days
  
+                # Welke rij-indices van df horen bij dit subject en dit datuminterval?
+                row_mask = (df["id"] == subj) & (df["date"] >= d1) & (df["date"] <= d2)
+                row_idx  = df.index[row_mask]
+ 
+                if gap_days <= PROLONGED_GAP_DAYS:
+                    # Kort gat: interpoleer het segment d1 tot d2
+                    segment      = s.loc[d1:d2].copy()
+                    segment_fill = segment.interpolate(method="index")
+ 
+                    # Schrijf de geinterpoleerde waarden terug via de rij-indices
+                    for ridx in row_idx:
+                        date_val = df.loc[ridx, "date"]
+                        if date_val in segment_fill.index:
+                            filled_val = segment_fill.loc[date_val]
+                            if pd.isna(new_values.loc[ridx]) and pd.notna(filled_val):
+                                new_values.loc[ridx] = filled_val
+                                n_interpolated += 1
+ 
+                else:
+                    # Lang gat: markeer rijen tussen d1 en d2 (exclusief eindpunten)
+                    between_mask = (
+                        (df["id"] == subj)
+                        & (df["date"] > d1)
+                        & (df["date"] < d2)
+                    )
+                    between_idx = df.index[between_mask]
+                    new_flags.loc[between_idx] = 1
+                    n_flagged += len(between_idx)
+ 
+        df[col]      = new_values
+        df[flag_col] = new_flags
+ 
+        n_still_nan = int(df[col].isna().sum())
+        print(f"  {col:<30} {n_interpolated} interpolated, "
+              f"{n_flagged} flagged, {n_still_nan} still NaN")
+ 
+    print()
     return df
  
  
-# ── STEP 6: REPORT ────────────────────────────────────────────────────────────
-def print_report(df_before, df_after):
-    print("\n" + "=" * 70)
-    print("CLEANING REPORT")
-    print("=" * 70)
-    print(f"Shape before: {df_before.shape}  →  after: {df_after.shape}")
+# STAP 5: VERIFICATIE
+def step5_report(df_before, df_after):
+    print("Step 5: verification")
+    orig_cols   = [c for c in df_before.columns if c in df_after.columns]
+    miss_before = int(df_before[orig_cols].isnull().sum().sum())
+    miss_after  = int(df_after[orig_cols].isnull().sum().sum())
+    print(f"  NaN cells: {miss_before:,} -> {miss_after:,}")
+    print()
  
-    print("\nRemaining NaNs per column:")
-    miss = df_after.isnull().sum()
-    miss = miss[miss > 0].sort_values(ascending=False)
-    if len(miss) == 0:
-        print("   None — fully imputed.")
+    data_cols   = [c for c in orig_cols if not c.endswith("_synthetic")]
+    remaining   = df_after[data_cols].isnull().sum()
+    remaining   = remaining[remaining > 0].sort_values(ascending=False)
+    if len(remaining) == 0:
+        print("  No NaNs remaining in data columns.")
     else:
-        for col, n in miss.items():
-            print(f"   {col:<40} {n:>4} ({n/len(df_after)*100:.1f}%)")
+        print("  Remaining NaNs:")
+        for col, n in remaining.items():
+            print(f"    {col:<35} {n:>4} ({n/len(df_after)*100:.1f}%)")
  
-    synth_cols = [c for c in df_after.columns if c.endswith("_synthetic")]
-    if synth_cols:
-        print("\nSynthetic flag summary (rows marked as highly imputed):")
-        for col in synth_cols:
-            n = df_after[col].sum()
-            print(f"   {col:<45} {int(n):>4} rows ({n/len(df_after)*100:.1f}%)")
+    print()
+    for col in [c for c in df_after.columns if c.endswith("_synthetic")]:
+        n = int(df_after[col].sum())
+        print(f"  Flag {col:<40} {n} rows")
+    print()
  
  
-# ── MAIN FUNCTION ─────────────────────────────────────────────────────────────
+# VERGELIJKINGSPLOTS
+def make_plots(df_before, df_after):
+    sns.set_theme(style="whitegrid", palette="muted")
+    data_cols_before = [c for c in df_before.select_dtypes(include=np.number).columns
+                        if not c.endswith("_synthetic")]
+ 
+    # Plot A: missing heatmap voor en na
+    fig, axes = plt.subplots(2, 1, figsize=(14, 10))
+    for ax, df, title in [(axes[0], df_before, "Before cleaning"),
+                          (axes[1], df_after,  "After cleaning")]:
+        cols = [c for c in data_cols_before if c in df.columns]
+        sns.heatmap(df[cols].isnull().astype(int).T,
+                    cmap="Blues", cbar=False,
+                    xticklabels=False, yticklabels=True, ax=ax)
+        ax.set_title(title, fontsize=10)
+        ax.set_xlabel("Day-records")
+    fig.suptitle("Missing Value Map: Before vs After", fontsize=12, y=1.01)
+    plt.tight_layout()
+    plt.savefig(ppath("missing_heatmap_comparison.png"), dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved: {ppath('missing_heatmap_comparison.png')}")
+ 
+    # Plot B: missingness percentage per variabele
+    fig, axes = plt.subplots(1, 2, figsize=(16, 7), sharey=True)
+    for ax, df, title in [(axes[0], df_before, "Before"),
+                          (axes[1], df_after,  "After")]:
+        cols = [c for c in data_cols_before if c in df.columns]
+        pct  = (df[cols].isnull().mean() * 100).sort_values(ascending=True)
+        colors = ["#c0392b" if v > 0 else "#4C72B0" for v in pct]
+        ax.barh(pct.index, pct.values, color=colors, alpha=0.85)
+        ax.set_xlabel("Missing (%)")
+        ax.set_xlim(0, 100)
+        ax.set_title(title)
+    fig.suptitle("Missingness per Variable: Before vs After")
+    plt.tight_layout()
+    plt.savefig(ppath("missingness_bars.png"), dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved: {ppath('missingness_bars.png')}")
+ 
+    # Plot C: verdelingen voor en na
+    fig, axes = plt.subplots(2, len(TIMESERIES_VARS),
+                             figsize=(len(TIMESERIES_VARS) * 4, 7))
+    for ci, col in enumerate(TIMESERIES_VARS):
+        if col not in df_before.columns:
+            continue
+        for ri, (df, color, label) in enumerate([
+            (df_before, "#DD8452", "Before"),
+            (df_after,  "#4C72B0", "After"),
+        ]):
+            ax = axes[ri][ci]
+            ax.hist(df[col].dropna(), bins=30, color=color,
+                    edgecolor="white", alpha=0.85)
+            ax.set_title(f"{col}\n{label}", fontsize=8)
+            ax.set_xlabel("value", fontsize=7)
+    fig.suptitle("Distributions Before vs After")
+    plt.tight_layout()
+    plt.savefig(ppath("distributions_comparison.png"), dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved: {ppath('distributions_comparison.png')}")
+ 
+    # Plot D: mood tijdreeks na cleaning voor de 6 meest ontbrekende proefpersonen
+    most_missing = (df_before.groupby("id")["mood"]
+                    .apply(lambda x: x.isna().sum())
+                    .sort_values(ascending=False)
+                    .head(6).index.tolist())
+ 
+    fig, axes = plt.subplots(len(most_missing), 1,
+                             figsize=(14, len(most_missing) * 2.5))
+    if len(most_missing) == 1:
+        axes = [axes]
+ 
+    for ax, subj in zip(axes, most_missing):
+        after = df_after[df_after["id"] == subj].sort_values("date")
+        flag  = "mood_synthetic"
+ 
+        ax.plot(after["date"], after["mood"], color="#95a5a6", lw=1, zorder=1)
+ 
+        real = after[after[flag] == 0] if flag in after.columns else after
+        ax.scatter(real["date"], real["mood"],
+                   color="#4C72B0", s=15, zorder=3, label="observed")
+ 
+        if flag in after.columns:
+            synth = after[after[flag] == 1]
+            if len(synth):
+                ax.scatter(synth["date"], synth["mood"],
+                           marker="x", color="#c0392b", s=30,
+                           zorder=4, label="synthetic (gap >3d)")
+ 
+        ax.set_ylim(1, 10)
+        ax.set_ylabel(subj, fontsize=7, rotation=0, labelpad=60, va="center")
+        ax.tick_params(axis="x", labelsize=7)
+        ax.legend(fontsize=6, loc="upper right")
+ 
+    axes[-1].set_xlabel("Date")
+    fig.suptitle("Mood After Cleaning  —  blue=observed  grey=interpolated  red=synthetic",
+                 y=1.02, fontsize=10)
+    plt.tight_layout()
+    plt.savefig(ppath("mood_timeseries_after.png"), dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved: {ppath('mood_timeseries_after.png')}")
+    print()
+ 
+    # Plot E: 3-color heatmap
+    plot_three_color_heatmap(df_before, df_after)
+ 
+    # Plot F: Per-subject activity threshold
+    plot_per_subject_activity_threshold(df_after)
+ 
+ 
+# PLOT E: 3-COLOUR HEATMAP (NaN vs 0 vs Real Values)
+def plot_three_color_heatmap(df_before, df_after):
+    """
+    Show NaN, 0, and real values in different colors.
+    White = real value > 0
+    Light gray = 0 (filled or original)
+    Dark blue = NaN (missing)
+    """
+    data_cols = [c for c in df_after.select_dtypes(include=np.number).columns
+                 if not c.endswith("_synthetic")]
+    
+    # Create numeric encoding: NaN=2 (blue), 0=1 (gray), >0=0 (white)
+    def encode_values(df):
+        encoded = np.zeros_like(df[data_cols].values, dtype=float)
+        for i, col in enumerate(data_cols):
+            encoded[:, i] = df[col].apply(
+                lambda x: 2 if pd.isna(x) else (1 if x == 0 else 0)
+            ).values
+        return encoded
+    
+    enc_before = encode_values(df_before)
+    enc_after = encode_values(df_after)
+    
+    cmap = plt.cm.colors.ListedColormap(["white", "#d3d3d3", "#4C72B0"])
+    
+    fig, axes = plt.subplots(2, 1, figsize=(16, 10))
+    
+    for ax, enc, title in [(axes[0], enc_before, "Before Cleaning"),
+                           (axes[1], enc_after, "After Cleaning")]:
+        im = ax.imshow(enc.T, cmap=cmap, aspect="auto", interpolation="nearest")
+        ax.set_yticks(range(len(data_cols)))
+        ax.set_yticklabels(data_cols, fontsize=8)
+        ax.set_xticks([])
+        ax.set_title(title, fontsize=10)
+        ax.set_xlabel("Day-records")
+    
+    cbar = fig.colorbar(im, ax=axes, orientation="vertical", pad=0.01, shrink=0.8)
+    cbar.set_ticks([0.33, 1, 1.67])
+    cbar.set_ticklabels(["Real value", "Zero (not used)", "Missing"], fontsize=8)
+    
+    fig.suptitle("Three-Color Heatmap: NaN vs 0 vs Real Values", fontsize=12, y=1.01)
+    plt.tight_layout()
+    plt.savefig(ppath("heatmap_three_color.png"), dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved: {ppath('heatmap_three_color.png')}")
+
+
+# PLOT F: PER-SUBJECT ACTIVITY LEVEL WITH THRESHOLD
+def plot_per_subject_activity_threshold(df_after):
+    """
+    For each subject, show how many columns had real data.
+    Green = above threshold (≥4, so NaNs get filled)
+    Red = below threshold (<4, so NaNs stay NaN)
+    """
+    data_cols = [c for c in df_after.select_dtypes(include=np.number).columns
+                 if not c.endswith("_synthetic")]
+    
+    # Count real (non-NaN, non-zero) values per row
+    df_after["real_count"] = (df_after[data_cols].notna() & (df_after[data_cols] > 0)).sum(axis=1)
+    
+    subjects = sorted(df_after["id"].unique())
+    n_subj = len(subjects)
+    
+    fig, axes = plt.subplots(n_subj, 1, figsize=(14, n_subj * 1.5), sharex=False)
+    if n_subj == 1:
+        axes = [axes]
+    
+    for ax, subj in zip(axes, subjects):
+        subj_data = df_after[df_after["id"] == subj].sort_values("date").reset_index(drop=True)
+        x = range(len(subj_data))
+        
+        # Plot as bars, color-coded by threshold
+        colors = ["#27ae60" if c >= MIN_ACTIVE_COLS else "#e74c3c"
+                  for c in subj_data["real_count"]]
+        ax.bar(x, subj_data["real_count"], color=colors, alpha=0.7, edgecolor="black", linewidth=0.5)
+        ax.axhline(MIN_ACTIVE_COLS, color="black", linestyle="--", linewidth=1.5,
+                   label=f"Threshold ({MIN_ACTIVE_COLS})")
+        
+        ax.set_ylabel(subj, fontsize=8, rotation=0, labelpad=50)
+        ax.set_ylim(0, len(data_cols))
+        ax.tick_params(axis="x", labelsize=6)
+        ax.legend(fontsize=6, loc="upper right")
+    
+    axes[-1].set_xlabel("Day-records per subject (sorted by date)")
+    fig.suptitle("Activity Level per Subject: Green ≥4 (fill NaN→0)  |  Red <4 (keep NaN)",
+                 fontsize=11, y=1.01)
+    plt.tight_layout()
+    plt.savefig(ppath("activity_threshold_per_subject.png"), dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved: {ppath('activity_threshold_per_subject.png')}")
+    print()
+
+
 def run(input_path=None):
     _setup_dirs()
  
     if input_path is None:
         input_path = ipath("df_wide.csv")
  
-    print("=" * 70)
+    print()
     print("DATA CLEANING")
-    print("=" * 70)
-    print(f"Reading: {input_path}")
+    print(f"Input: {input_path}")
+    print()
  
     df = pd.read_csv(input_path, parse_dates=["date"])
     df_before = df.copy()
  
-    df = remove_hard_errors(df)
-    df = winsorise(df)
-    df = encode_binary_presence(df)
-    df = zero_fill_app_cats(df)
-    df = impute_timeseries(df)
+    df = step1_remove_hard_errors(df)
+    df = step2_conditional_zero_fill(df)
+    df = step3_4_interpolate_and_flag(df)
+    step5_report(df_before, df)
  
-    print_report(df_before, df)
+    print("Generating plots...")
+    make_plots(df_before, df)
  
     out = opath("df_clean.csv")
     df.to_csv(out, index=False)
-    print(f"\nSaved: {out}")
+    print(f"Saved: {out}")
+    print()
  
     return df
  
  
-# ── STANDALONE ENTRY POINT ────────────────────────────────────────────────────
+# LOS STARTPUNT
 if __name__ == "__main__":
     run()
