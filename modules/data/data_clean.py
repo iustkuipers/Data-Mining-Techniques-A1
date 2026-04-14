@@ -37,7 +37,8 @@ ACTIVITY_EVIDENCE_COLS = (
 )
  
 PROLONGED_GAP_DAYS = 3
-MIN_ACTIVE_COLS    = 4   # minimaal aantal andere kolommen met echte data
+MIN_ACTIVE_COLS    = 2   # minimaal aantal andere kolommen met echte data
+FFILL_MAX_DAYS     = 5   # maximum days to forward-fill mood after long gaps
  
  
 # STAP 1: HARDE FOUTEN VERWIJDEREN
@@ -64,33 +65,19 @@ def step1_remove_hard_errors(df):
 # Bij minder dan MIN_ACTIVE_COLS actieve kolommen laten we NaN staan.
 # Dit werkt per rij dus automatisch per proefpersoon per dag.
 def step2_conditional_zero_fill(df):
-    print(f"Step 2: conditional zero-fill (min {MIN_ACTIVE_COLS} other active cols per row)")
- 
-    # Bereken per rij het aantal kolommen met echte niet-nul waarden
-    evidence_cols = [c for c in ACTIVITY_EVIDENCE_COLS if c in df.columns]
-    # notna en > 0 tegelijk gecontroleerd via applymap
-    active_counts = (df[evidence_cols].notna() & (df[evidence_cols] > 0)).sum(axis=1)
- 
+    print("Step 2: Aggressive zero-fill for duration/event variables")
+    
+    # If it's an app category, call, or sms, and it's NaN, it means 0 seconds/events.
     for col in ZERO_FILL_VARS:
         if col not in df.columns:
             continue
+        
         is_nan = df[col].isna()
- 
-        # Bereken voor elke rij het aantal actieve ANDERE kolommen
-        # (trek de bijdrage van col zelf af als die er al in zit)
-        if col in evidence_cols:
-            col_contributes = (df[col].notna() & (df[col] > 0)).astype(int)
-            other_active = active_counts - col_contributes
-        else:
-            other_active = active_counts
- 
-        fill_mask = is_nan & (other_active >= MIN_ACTIVE_COLS)
-        n_filled  = int(fill_mask.sum())
-        n_left    = int(is_nan.sum()) - n_filled
- 
-        df.loc[fill_mask, col] = 0
-        print(f"  {col:<35} filled {n_filled:>4}, left as NaN {n_left:>4}")
- 
+        n_filled = int(is_nan.sum())
+        
+        df.loc[is_nan, col] = 0
+        print(f"  {col:<35} filled {n_filled:>4} NaNs with 0")
+
     print()
     return df
  
@@ -179,6 +166,74 @@ def step3_4_interpolate_and_flag(df):
     return df
  
  
+# STAP 4B: GECAPPED FORWARD-FILL VOOR RESTERENDE NaN IN TIMESERIES
+# Na de interpolatie blijven lange gaten (>3 dagen) als NaN staan.
+# Deze gaten zijn grotendeels studieverlaters en sensoruitval, niet willekeurig.
+# We vullen ze met forward-fill gecapped op FFILL_MAX_DAYS dagen:
+#   - Mood inertia (Kuppens et al., 2010) rechtvaardigt het doortrekken van
+#     de laatste bekende waarde als korte-termijn schatting.
+#   - Capping op 5 dagen voorkomt dat verouderde waarden te lang worden
+#     doorgevoerd; na 5 dagen zonder observatie blijft NaN staan.
+#   - Alleen toegepast op TIMESERIES_VARS (mood, arousal, valence, screen,
+#     activity) — niet op event/duration variabelen die al 0-gevuld zijn.
+#   - Synthetic flag blijft 1 voor forward-filled rijen zodat het model
+#     onderscheid kan maken tussen geobserveerde en ingevulde waarden.
+def step4b_capped_ffill(df):
+    print(f"Step 4b: capped forward-fill (max {FFILL_MAX_DAYS}d) for remaining NaN")
+    df = df.sort_values(["id", "date"]).reset_index(drop=True)
+
+    for col in TIMESERIES_VARS:
+        if col not in df.columns:
+            continue
+        flag_col  = col + "_synthetic"
+        n_filled  = 0
+
+        for subj, grp in df.groupby("id", sort=False):
+            idx      = grp.index
+            series   = df.loc[idx, col].copy()
+            dates    = df.loc[idx, "date"].values
+
+            # Forward-fill with day-count cap per subject
+            last_val  = np.nan
+            last_date = None
+
+            for i, (ridx, date) in enumerate(zip(idx, dates)):
+                val = series[ridx]
+                if pd.notna(val):
+                    last_val  = val
+                    last_date = date
+                elif pd.notna(last_val):
+                    gap = (pd.Timestamp(date) - pd.Timestamp(last_date)).days
+                    if gap <= FFILL_MAX_DAYS:
+                        df.loc[ridx, col] = last_val
+                        if flag_col in df.columns:
+                            df.loc[ridx, flag_col] = 1  # mark as synthetic
+                        n_filled += 1
+                    # else: leave as NaN — gap too large
+
+        n_still_nan = int(df[col].isna().sum())
+        print(f"  {col:<30} {n_filled} forward-filled, {n_still_nan} still NaN")
+
+    print()
+    return df
+
+
+def step4c_subject_median_fill(df):
+    print("Step 4c: Filling remaining timeseries NaNs with subject-specific medians")
+    
+    for col in TIMESERIES_VARS:
+        if col not in df.columns:
+            continue
+            
+        # Fill remaining NaNs with the median of THAT specific subject
+        df[col] = df.groupby("id")[col].transform(lambda x: x.fillna(x.median()))
+        
+        n_still_nan = int(df[col].isna().sum())
+        print(f"  {col:<30} {n_still_nan} still NaN after subject-median fill")
+        
+    print()
+    return df
+
 # STAP 5: VERIFICATIE
 def step5_report(df_before, df_after):
     print("Step 5: verification")
@@ -424,6 +479,8 @@ def run(input_path=None):
     df = step1_remove_hard_errors(df)
     df = step2_conditional_zero_fill(df)
     df = step3_4_interpolate_and_flag(df)
+    df = step4b_capped_ffill(df)
+    df = step4c_subject_median_fill(df)
     step5_report(df_before, df)
  
     print("Generating plots...")

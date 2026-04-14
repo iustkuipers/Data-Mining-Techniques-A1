@@ -1,0 +1,8 @@
+pandas==3.0.1
+numpy==2.4.3
+matplotlib==3.10.8
+seaborn==0.13.2
+scikit-learn==1.8.0
+xgboost==3.2.0
+optuna==4.8.0
+torch --index-url https://download.pytorch.org/whl/cu126
